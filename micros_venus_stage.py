@@ -2,7 +2,7 @@ import serial
 import time
 from typing import Optional, List, Tuple, Union
 from enum import Enum
-
+import threading 
 
 class AxisState(Enum):
     """Axis state flags"""
@@ -18,7 +18,7 @@ class PolluxVenusStageController:
     Implements Venus-2 RPN (Reverse Polish Notation) command syntax.
     """
     
-    def __init__(self, port: str, baudrate: int = 19260, timeout: float = 1.0):
+    def __init__(self, port: str, baudrate: int = 19260, timeout: float = 1.0, debug: bool=False):
         """
         Initialize connection to Pollux controller.
         
@@ -27,6 +27,7 @@ class PolluxVenusStageController:
             baudrate: Communication speed
             timeout: Read timeout in seconds
         """
+        self.debug = debug
         self.serial = serial.Serial(
             port=port,
             baudrate=baudrate,
@@ -37,6 +38,7 @@ class PolluxVenusStageController:
         )
         time.sleep(0.1)
         self._clear_buffer()
+        self.lock = threading.Lock()
         
     def _clear_buffer(self):
         """Clear input buffer"""
@@ -54,14 +56,21 @@ class PolluxVenusStageController:
         Returns:
             Response from controller
         """
-        if not command.endswith('\r'):
-            command += '\r'
+        if not command.endswith(' '):
+            command += ' '
         
-        self.serial.write(command.encode('ascii'))
+        if self.debug:
+            t0 = time.monotonic()
+            print(f"send_command: {repr(command)}")
+        with self.lock:
+            self.serial.write(command.encode('ascii'))
         
-        if wait_response:
-            response = self.serial.readline().decode('ascii').strip()
-            return response
+            if wait_response:
+                response = self.serial.readline().decode('ascii').strip()
+                if self.debug:
+                    t1 = time.monotonic()
+                    print(f"\t response: {repr(response)} [dt={t1-t0}]")
+                return response
         return ""
     
     # ==========================================
@@ -83,7 +92,7 @@ class PolluxVenusStageController:
         Returns:
             Controller response
         """
-        return self.send_command(f"{position} {axis} nmove")
+        return self.send_command(f"{position:1.6f} {axis} nmove", wait_response=False)
     
     def nrmove(self, distance: float, axis: int) -> str:
         """
@@ -99,7 +108,7 @@ class PolluxVenusStageController:
         Returns:
             Controller response
         """
-        return self.send_command(f"{distance} {axis} nrmove")
+        return self.send_command(f"{distance:1.6f} {axis} nrmove", wait_response=False)
     
     def ncal(self, axis: int) -> str:
         """
@@ -114,7 +123,7 @@ class PolluxVenusStageController:
         Returns:
             Controller response
         """
-        return self.send_command(f"{axis} ncal")
+        return self.send_command(f"{axis} ncal", wait_response=False)
     
     def nman(self, axis: int, direction: int = 1) -> str:
         """
@@ -401,7 +410,7 @@ coordinates of the limits will be recalculated accordingly.
         Returns:
             Controller response
         """
-        return self.send_command(f"{velocity} {axis} setnvel")
+        return self.send_command(f"{velocity} {axis} setnvel", wait_response=False)
     
     def setnacc(self, acceleration: float, axis: int) -> str:
         """
@@ -416,7 +425,7 @@ coordinates of the limits will be recalculated accordingly.
         Returns:
             Controller response
         """
-        return self.send_command(f"{acceleration} {axis} setnacc")
+        return self.send_command(f"{acceleration} {axis} setnacc", wait_response=False)
     
     def setndec(self, deceleration: float, axis: int) -> str:
         """
@@ -431,7 +440,7 @@ coordinates of the limits will be recalculated accordingly.
         Returns:
             Controller response
         """
-        return self.send_command(f"{deceleration} {axis} setndec")
+        return self.send_command(f"{deceleration} {axis} setndec", wait_response=False)
     
     def setnramp(self, ramp: float, axis: int) -> str:
         """
@@ -446,7 +455,7 @@ coordinates of the limits will be recalculated accordingly.
         Returns:
             Controller response
         """
-        return self.send_command(f"{ramp} {axis} setnramp")
+        return self.send_command(f"{ramp} {axis} setnramp", wait_response=False)
     
     def setncalvel(self, velocity: float, axis: int) -> str:
         """
@@ -564,16 +573,84 @@ coordinates of the limits will be recalculated accordingly.
     def nst(self, axis: int) -> str:
         """
         Get axis status.
-        
+
         Venus-2 Syntax: [axisno] nst
-        
+
         Args:
             axis: Axis number
-            
+
         Returns:
             Status string
         """
         return self.send_command(f"{axis} nst")
+
+    def nstatus(self, axis: int) -> Optional[int]:
+        """
+        Get current state of the axis as a decimal status code.
+
+        The status code is a decimal value representing binary flags:
+        D0 (1): Move in progress (0=finished, 1=in progress)
+        D1 (2): no function
+        D2 (4): Machine error occurred (Pollux NT only)
+        D3 (8): no function
+        D4 (16): Speed mode on/off
+        D5 (32): Closed Loop In-Window function (Pollux NT only)
+        D6 (64): Motor driver state (hardware option)
+        D7 (128): Motion enable state (hardware option)
+
+        Venus-2 Syntax: [axisno] nstatus
+
+        Args:
+            axis: Axis number
+
+        Returns:
+            Decimal status code or None if error
+        """
+        response = self.send_command(f"{axis} nstatus")
+        try:
+            return int(response)
+        except (ValueError, AttributeError):
+            return None
+
+    def decode_nstatus(self, status_code: int) -> dict:
+        """
+        Decode the nstatus decimal value into individual status flags.
+
+        Args:
+            status_code: Decimal status code from nstatus command
+
+        Returns:
+            Dictionary with decoded status flags:
+            - move_in_progress: bool (True=moving, False=finished)
+            - machine_error: bool (Pollux NT only)
+            - speed_mode: bool
+            - closed_loop_in_window: bool (Pollux NT only)
+            - motor_driver_enabled: bool (hardware option)
+            - motion_enabled: bool (hardware option)
+        """
+        return {
+            'move_in_progress': bool(status_code & 0b00000001),  # D0
+            'machine_error': bool(status_code & 0b00000100),     # D2
+            'speed_mode': bool(status_code & 0b00010000),        # D4
+            'closed_loop_in_window': bool(status_code & 0b00100000),  # D5
+            'motor_driver_enabled': bool(status_code & 0b01000000),   # D6
+            'motion_enabled': bool(status_code & 0b10000000),    # D7
+        }
+
+    def is_moving(self, axis: int) -> Optional[bool]:
+        """
+        Check if axis is currently moving using nstatus command.
+
+        Args:
+            axis: Axis number
+
+        Returns:
+            True if moving, False if finished, None if error
+        """
+        status_code = self.nstatus(axis)
+        if status_code is None:
+            return None
+        return bool(status_code & 0b00000001)
     
     def np(self) -> str:
         """

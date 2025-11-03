@@ -50,6 +50,10 @@ class MicrosPolluxStageHW(HardwareComponent):
         self.settings.New('x_position', ro=True, **xy_kwargs)
         self.settings.New('y_position', ro=True, **xy_kwargs)
 
+        # Movement status (read-only)
+        self.settings.New('x_moving', dtype=bool, ro=True, initial=False)
+        self.settings.New('y_moving', dtype=bool, ro=True, initial=False)
+
         # Target position settings (writable)
         self.settings.New('x_target', ro=False, **xy_kwargs)
         self.settings.New('y_target', ro=False, **xy_kwargs)
@@ -91,7 +95,7 @@ class MicrosPolluxStageHW(HardwareComponent):
         # Update timer for reading positions
         self.update_timer = QtCore.QTimer()
         self.update_timer.timeout.connect(self.on_update_timer)
-        self.update_timer.start(1000)  # Update every 10000ms
+        # Timer will be started in connect() method
 
     def connect(self):
         """Connect to the Pollux stage controller."""
@@ -101,12 +105,17 @@ class MicrosPolluxStageHW(HardwareComponent):
         self.stage = PolluxVenusStageController(
             port=S['port'],
             baudrate=S['baudrate'],
-            timeout=1.0
+            timeout=1.0,
+            debug=self.settings['debug_mode']
         )
 
         # Connect position logged quantities (read-only)
         S.x_position.connect_to_hardware(read_func=self.read_pos_x)
         S.y_position.connect_to_hardware(read_func=self.read_pos_y)
+
+        # Connect movement status logged quantities (read-only)
+        S.x_moving.connect_to_hardware(read_func=self.read_x_moving)
+        S.y_moving.connect_to_hardware(read_func=self.read_y_moving)
 
         # Connect debug mode
         def set_debug_mode(val):
@@ -151,36 +160,46 @@ class MicrosPolluxStageHW(HardwareComponent):
         # Flag to track if other observers are reading position
         self.other_observer = False
 
+        # Start the update timer
+        self.update_timer.start(1000)
+
         self._is_connected = True
 
     def disconnect(self):
         """Disconnect from the Pollux stage controller."""
+
+        self.update_timer.stop()
 
         # Disconnect all settings from hardware
         self.settings.disconnect_all_from_hardware()
 
         # Close the stage connection
         if hasattr(self, 'stage'):
+
             self.stage.close()
             del self.stage
 
         self._is_connected = False
 
     def on_update_timer(self):
-        """Periodic update of position readings."""
+        """Periodic update of position and moving status readings."""
         if self.settings['connected']:
             try:
                 self.settings.x_position.read_from_hardware()
                 self.settings.y_position.read_from_hardware()
+                self.settings.x_moving.read_from_hardware()
+                self.settings.y_moving.read_from_hardware()
             except Exception as err:
                 if self.settings['debug_mode']:
-                    print(f"Error reading position: {err}")
+                    print(f"Error reading position/status: {err}")
 
             # Adjust timer interval based on whether other observers are active
             if self.other_observer:
-                self.update_timer.setInterval(1000)
+                self.update_timer.setInterval(2000)
+            elif (self.settings['x_moving'] or self.settings['y_moving']):
+                self.update_timer.setInterval(10)
             else:
-                self.update_timer.setInterval(200)
+                self.update_timer.setInterval(1000)
 
     # Position reading methods
     def read_pos_x(self):
@@ -197,18 +216,35 @@ class MicrosPolluxStageHW(HardwareComponent):
             raise IOError(f"Failed to read Y position (axis {self.y_axis})")
         return -pos if self.invert_y else pos
 
+    # Movement status reading methods
+    def read_x_moving(self):
+        """Read X axis moving status from hardware using nstatus command."""
+        moving = self.stage.is_moving(self.x_axis)
+        if moving is None:
+            raise IOError(f"Failed to read X moving status (axis {self.x_axis})")
+        return moving
+
+    def read_y_moving(self):
+        """Read Y axis moving status from hardware using nstatus command."""
+        moving = self.stage.is_moving(self.y_axis)
+        if moving is None:
+            raise IOError(f"Failed to read Y moving status (axis {self.y_axis})")
+        return moving
+
     # Movement methods
     def move_x(self, target):
         """Move X axis to absolute position."""
         if self.invert_x:
             target = -target
         self.stage.nmove(target, self.x_axis)
+        self.on_update_timer()
 
     def move_y(self, target):
         """Move Y axis to absolute position."""
         if self.invert_y:
             target = -target
         self.stage.nmove(target, self.y_axis)
+        self.on_update_timer()
 
     def move_x_rel(self, distance):
         """Move X axis relative to current position."""
@@ -271,13 +307,13 @@ class MicrosPolluxStageHW(HardwareComponent):
     # Status methods
     def is_busy_x(self):
         """Check if X axis is moving."""
-        status = self.stage.nst(self.x_axis)
-        return 'moving' in status.lower()
+        status = self.stage.is_moving(self.x_axis)
+        return status
 
     def is_busy_y(self):
         """Check if Y axis is moving."""
-        status = self.stage.nst(self.y_axis)
-        return 'moving' in status.lower()
+        status = self.stage.is_moving(self.y_axis)
+        return status
 
     def is_busy_xy(self):
         """Check if either axis is moving."""
