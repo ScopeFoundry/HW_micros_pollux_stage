@@ -193,13 +193,17 @@ class MicrosPolluxStageHW(HardwareComponent):
                 if self.settings['debug_mode']:
                     print(f"Error reading position/status: {err}")
 
-            # Adjust timer interval based on whether other observers are active
-            if self.other_observer:
-                self.update_timer.setInterval(2000)
-            elif (self.settings['x_moving'] or self.settings['y_moving']):
-                self.update_timer.setInterval(10)
-            else:
-                self.update_timer.setInterval(1000)
+            # Adjust timer interval based on whether other observers are active.
+            # Only touch the QTimer from the thread that owns it (the GUI thread):
+            # move_x/move_y also call this from a measurement worker thread, where
+            # setInterval would raise "Timers cannot be started from another thread".
+            if QtCore.QThread.currentThread() is self.update_timer.thread():
+                if self.other_observer:
+                    self.update_timer.setInterval(2000)
+                elif (self.settings['x_moving'] or self.settings['y_moving']):
+                    self.update_timer.setInterval(10)
+                else:
+                    self.update_timer.setInterval(1000)
 
     # Position reading methods
     def read_pos_x(self):
